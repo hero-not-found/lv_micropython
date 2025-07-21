@@ -54,6 +54,7 @@
 #include "shared/runtime/pyexec.h"
 #include "shared/timeutils/timeutils.h"
 #include "shared/tinyusb/mp_usbd.h"
+#include "shared/tinyusb/mp_usbd_cdc.h"
 #include "mbedtls/platform_time.h"
 
 #include "uart.h"
@@ -96,6 +97,17 @@ time_t platform_mbedtls_time(time_t *timer) {
     return tv.tv_sec + TIMEUTILS_SECONDS_1970_TO_2000;
 }
 
+
+int mp_log_vprintf(const char *format, va_list ap) {
+  // convert the format string to a c string and output it
+  char formatted_str[256];
+  int len = vsnprintf(formatted_str, sizeof(formatted_str), format, ap);
+  mp_uint_t cdc_res = mp_usbd_cdc_tx_strn(formatted_str, len);
+  mp_usbd_cdc_tx_strn("\r", 1);
+  return len;
+}
+
+
 void mp_task(void *pvParameter) {
     volatile uint32_t sp = (uint32_t)esp_cpu_get_sp();
     #if MICROPY_PY_THREAD
@@ -110,6 +122,9 @@ void mp_task(void *pvParameter) {
     uart_stdout_init();
     #endif
     machine_init();
+
+    // forward logs to output
+    esp_log_set_vprintf(mp_log_vprintf);
 
     // Configure time function, for mbedtls certificate time validation.
     mbedtls_platform_set_time(platform_mbedtls_time);
