@@ -34,6 +34,8 @@
 #include "freertos/queue.h"
 #include "esp_task.h"
 
+#include "esp_log.h"
+
 // Notes on this port's specific implementation of I2S:
 // - a FreeRTOS task is created to implement the asynchronous background operations
 // - a FreeRTOS queue is used to transfer the supplied buffer to the background task
@@ -101,6 +103,17 @@ static const int8_t i2s_frame_map[NUM_I2S_USER_FORMATS][I2S_RX_FRAME_SIZE_IN_BYT
     { 0,  1,  2,  3, -1, -1, -1, -1 },  // Mono, 32-bits
     { 2,  3,  6,  7, -1, -1, -1, -1 },  // Stereo, 16-bits
     { 0,  1,  2,  3,  4,  5,  6,  7 },  // Stereo, 32-bits
+};
+
+// TX always writes to DMA in 32-bit stereo format (8 bytes per frame)
+#define I2S_TX_FRAME_SIZE_IN_BYTES (8)
+
+// TX frame size mapping for each user format (bytes per frame in user format)
+static const uint8_t i2s_tx_user_frame_size[NUM_I2S_USER_FORMATS] = {
+    2,  // Mono, 16-bits: 2 bytes per sample
+    4,  // Mono, 32-bits: 4 bytes per sample  
+    4,  // Stereo, 16-bits: 2 bytes * 2 channels = 4 bytes per frame
+    8,  // Stereo, 32-bits: 4 bytes * 2 channels = 8 bytes per frame
 };
 
 void machine_i2s_init0() {
@@ -245,24 +258,95 @@ static size_t copy_appbuf_to_dma(machine_i2s_obj_t *self, mp_buffer_info_t *appb
         delay = portMAX_DELAY;  // block until supplied buffer is emptied
     }
 
-    // if we're in full duplex mode and mode isn't stereo 32 bits, we need to transform the app buffer
+    // if we're in full duplex mode and format isn't stereo 32 bits, we need to transform the app buffer
     if (self->mode & MICROPY_PY_MACHINE_I2S_CONSTANT_RX && 
         (self->format != STEREO || self->bits != I2S_DATA_BIT_WIDTH_32BIT)) {
-        // transform the app buffer from the app buffer format to the DMA format (always 32 bit stereo).
-    
-    }
+        
+        // Transform the app buffer from the app buffer format to the DMA format (always 32 bit stereo).
+        // Process the app buffer in chunks using the transform buffer
+        
+        uint8_t f_index = get_frame_mapping_index(self->bits, self->format);
+        uint8_t user_frame_size = i2s_tx_user_frame_size[f_index];
+        uint32_t app_index = 0;
+        uint8_t *app_p = (uint8_t *)appbuf->buf;
+        
+        while (app_index < appbuf->len) {
+            // Calculate how many user frames can fit in the transform buffer
+            uint32_t frames_in_transform_buf = SIZEOF_TRANSFORM_BUFFER_IN_BYTES / I2S_TX_FRAME_SIZE_IN_BYTES;
+            uint32_t user_bytes_to_process = MIN(frames_in_transform_buf * user_frame_size, appbuf->len - app_index);
+            uint32_t frames_to_process = user_bytes_to_process / user_frame_size;
+            
+            // Transform user format frames to DMA format frames
+            for (uint32_t frame = 0; frame < frames_to_process; frame++) {
+                uint8_t *dma_frame = self->transform_buffer + (frame * I2S_TX_FRAME_SIZE_IN_BYTES);
+                uint8_t *user_frame = app_p + app_index + (frame * user_frame_size);
+                
+                // Initialize DMA frame to zero (clears right channel for mono)
+                memset(dma_frame, 0, I2S_TX_FRAME_SIZE_IN_BYTES);
+                
+                if (self->format == MONO) {
+                    if (self->bits == I2S_DATA_BIT_WIDTH_16BIT) {
+                        // Mono 16-bit: output to left channel only, pad to 32-bit
+                        int16_t sample = *((int16_t *)user_frame);
+                        *((int32_t *)&dma_frame[0]) = (int32_t)sample << 16;  // Left channel
+                        // Right channel stays zero from memset
+                    } else { // 32-bit
+                        // Mono 32-bit: output to left channel only
+                        int32_t sample = *((int32_t *)user_frame);
+                        *((int32_t *)&dma_frame[0]) = sample;  // Left channel
+                        // Right channel stays zero from memset
+                    }
+                } else { // STEREO
+                    if (self->bits == I2S_DATA_BIT_WIDTH_16BIT) {
+                        // Stereo 16-bit: pad each sample to 32-bit
+                        int16_t left_sample = *((int16_t *)&user_frame[0]);
+                        int16_t right_sample = *((int16_t *)&user_frame[2]);
+                        *((int32_t *)&dma_frame[0]) = (int32_t)left_sample << 16;   // Left channel
+                        *((int32_t *)&dma_frame[4]) = (int32_t)right_sample << 16;  // Right channel
+                    }
+                    // Note: Stereo 32-bit doesn't need transformation - it's already in DMA format
+                }
+            }
+            
+            // Write transformed data to DMA
+            size_t transform_bytes = frames_to_process * I2S_TX_FRAME_SIZE_IN_BYTES;
+            size_t bytes_written_chunk = 0;
+            
+            esp_err_t ret = i2s_channel_write(self->i2s_chan_handle_tx, self->transform_buffer, 
+                                            transform_bytes, &bytes_written_chunk, delay);
+            
+            if ((self->io_mode != ASYNCIO) ||
+                ((self->io_mode == ASYNCIO) && (ret != ESP_ERR_TIMEOUT))) {
+                check_esp_err(ret);
+            }
+            
+            // Calculate how many user bytes this represents
+            uint32_t dma_frames_written = bytes_written_chunk / I2S_TX_FRAME_SIZE_IN_BYTES;
+            uint32_t user_bytes_written = dma_frames_written * user_frame_size;
+            
+            num_bytes_written += user_bytes_written;
+            app_index += user_bytes_to_process;
+            
+            if ((self->io_mode == ASYNCIO) && (bytes_written_chunk < transform_bytes)) {
+                // Unable to empty the entire transform buffer into DMA memory
+                self->dma_buffer_status_tx = DMA_MEMORY_FULL;
+                break;
+            }
+        }
+    } else {
+        // No transformation needed - write directly to DMA
+        esp_err_t ret = i2s_channel_write(self->i2s_chan_handle_tx, appbuf->buf, appbuf->len, &num_bytes_written, delay);
 
-    esp_err_t ret = i2s_channel_write(self->i2s_chan_handle_tx, appbuf->buf, appbuf->len, &num_bytes_written, delay);
+        // i2s_channel_write returns ESP_ERR_TIMEOUT when buffer cannot be emptied by the timeout delay.
+        if ((self->io_mode != ASYNCIO) ||
+            ((self->io_mode == ASYNCIO) && (ret != ESP_ERR_TIMEOUT))) {
+            check_esp_err(ret);
+        }
 
-    // i2s_channel_write returns ESP_ERR_TIMEOUT when buffer cannot be emptied by the timeout delay.
-    if ((self->io_mode != ASYNCIO) ||
-        ((self->io_mode == ASYNCIO) && (ret != ESP_ERR_TIMEOUT))) {
-        check_esp_err(ret);
-    }
-
-    if ((self->io_mode == ASYNCIO) && (num_bytes_written < appbuf->len)) {
-        // Unable to empty the entire app buffer into DMA memory.  This indicates all DMA TX buffers are full.
-        self->dma_buffer_status_tx = DMA_MEMORY_FULL;
+        if ((self->io_mode == ASYNCIO) && (num_bytes_written < appbuf->len)) {
+            // Unable to empty the entire app buffer into DMA memory.  This indicates all DMA TX buffers are full.
+            self->dma_buffer_status_tx = DMA_MEMORY_FULL;
+        }
     }
 
     return num_bytes_written;
@@ -438,6 +522,9 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
             },
         },
     };
+
+    ESP_LOGI("i2s", "user requested stereo: %d format: %d slot cfg stereo: %d slot format: %d", 
+             (format == STEREO), bits, slot_cfg.slot_mode == I2S_SLOT_MODE_STEREO, slot_cfg.data_bit_width);
 
     if (self->i2s_chan_handle_tx) {
         check_esp_err(i2s_channel_init_std_mode(self->i2s_chan_handle_tx, &std_cfg));
