@@ -34,8 +34,6 @@
 #include "freertos/queue.h"
 #include "esp_task.h"
 
-#include "esp_log.h"
-
 // Notes on this port's specific implementation of I2S:
 // - a FreeRTOS task is created to implement the asynchronous background operations
 // - a FreeRTOS queue is used to transfer the supplied buffer to the background task
@@ -522,9 +520,6 @@ static void mp_machine_i2s_init_helper(machine_i2s_obj_t *self, mp_arg_val_t *ar
             },
         },
     };
-
-    ESP_LOGI("i2s", "user requested stereo: %d format: %d slot cfg stereo: %d slot format: %d", 
-             (format == STEREO), bits, slot_cfg.slot_mode == I2S_SLOT_MODE_STEREO, slot_cfg.data_bit_width);
 
     if (self->i2s_chan_handle_tx) {
         check_esp_err(i2s_channel_init_std_mode(self->i2s_chan_handle_tx, &std_cfg));
