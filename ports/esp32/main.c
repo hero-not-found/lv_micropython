@@ -97,7 +97,7 @@ time_t platform_mbedtls_time(time_t *timer) {
     return tv.tv_sec + TIMEUTILS_SECONDS_1970_TO_2000;
 }
 
-
+#if MICROPY_HW_USB_CDC && MICROPY_HW_ENABLE_USBDEV && !MICROPY_EXCLUDE_SHARED_TINYUSB_USBD_CDC
 int mp_log_vprintf(const char *format, va_list ap) {
   // convert the format string to a c string and output it
   char formatted_str[256];
@@ -106,7 +106,7 @@ int mp_log_vprintf(const char *format, va_list ap) {
   mp_usbd_cdc_tx_strn("\r", 1);
   return len;
 }
-
+#endif
 
 void mp_task(void *pvParameter) {
     volatile uint32_t sp = (uint32_t)esp_cpu_get_sp();
@@ -123,8 +123,10 @@ void mp_task(void *pvParameter) {
     #endif
     machine_init();
 
+    #if MICROPY_HW_USB_CDC && MICROPY_HW_ENABLE_USBDEV && !MICROPY_EXCLUDE_SHARED_TINYUSB_USBD_CDC
     // forward logs to output
     esp_log_set_vprintf(mp_log_vprintf);
+    #endif
 
     // Configure time function, for mbedtls certificate time validation.
     mbedtls_platform_set_time(platform_mbedtls_time);
