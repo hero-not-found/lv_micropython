@@ -125,7 +125,7 @@ void mp_task(void *pvParameter) {
 
     #if MICROPY_HW_USB_CDC && MICROPY_HW_ENABLE_USBDEV && !MICROPY_EXCLUDE_SHARED_TINYUSB_USBD_CDC
     // forward logs to output
-    esp_log_set_vprintf(mp_log_vprintf);
+    // esp_log_set_vprintf(mp_log_vprintf);
     #endif
 
     // Configure time function, for mbedtls certificate time validation.
